@@ -40,11 +40,15 @@ TAB_PAIR = "Pairing Harian"
 P_COLS = ["Tanggal", "Kode Head", "Kode Trailer", "Diisi Oleh", "Waktu Input", "Driver"]
 NO_TRAILER = "(tanpa trailer)"
 NO_DRIVER = "(tanpa driver)"
+TAB_DRIVER = "Master Driver"
+DR_COLS = ["Kode Driver", "Nama Driver", "Jenis SIM", "Masa Berlaku SIM", "Status Driver", "Dibuat Oleh", "Waktu Input"]
+JENIS_SIM = ["B1", "B1 Umum", "B2", "B2 Umum"]
+STATUS_DRIVER = ["Aktif", "Cuti", "Sakit", "Nonaktif"]
 
 ROLES = {
     "owner": ["Dashboard"],
     "input": ["Dashboard", "Ready & Pairing", "Work Order Baru", "Update Work Order", "Status Harian"],
-    "admin": ["Dashboard", "Ready & Pairing", "Work Order Baru", "Update Work Order", "Status Harian", "Kelola Asset"],
+    "admin": ["Dashboard", "Ready & Pairing", "Work Order Baru", "Update Work Order", "Status Harian", "Kelola Asset", "Kelola Driver"],
 }
 
 WIB = timezone(timedelta(hours=7))
@@ -115,21 +119,6 @@ def ensure_tab_once(name, header):
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title=name, rows=2000, cols=len(header) + 2)
         ws.update(values=[header], range_name="A1")
-        st.cache_data.clear()
-    st.session_state[key] = True
-
-
-def ensure_list_column_once(name):
-    """Tambahkan kolom daftar pilihan (mis. Driver) di tab Daftar Pilihan bila belum ada."""
-    key = f"listcol_{name}"
-    if st.session_state.get(key):
-        return
-    ws = get_sheet().worksheet(TAB_LIST)
-    have = ws.row_values(1)
-    if name not in have:
-        if ws.col_count < len(have) + 1:
-            ws.resize(cols=len(have) + 3)
-        ws.update(values=[[name]], range_name=rowcol_to_a1(1, len(have) + 1))
         st.cache_data.clear()
     st.session_state[key] = True
 
@@ -362,6 +351,15 @@ def page_dashboard():
             st.caption("Belum ada data biaya.")
         else:
             st.bar_chart(b.groupby(b["Tanggal Selesai"].dt.to_period("M").astype(str))["Biaya (Rp)"].sum())
+
+    st.subheader("Driver: SIM segera habis (60 hari)")
+    al = sim_alerts(load_drivers())
+    if al.empty:
+        st.caption("Tidak ada SIM yang habis dalam 60 hari ke depan.")
+    else:
+        st.dataframe(al[["Nama Driver", "Jenis SIM", "Masa Berlaku SIM", "Sisa Hari", "Status Driver"]],
+                     hide_index=True, width="stretch",
+                     column_config={"Masa Berlaku SIM": st.column_config.DateColumn(format="DD MMM YYYY")})
 
 
 # ----------------------------------------------------------------------------
@@ -631,7 +629,6 @@ def page_pairing():
     if "flash" in st.session_state:
         st.success(st.session_state.pop("flash"))
     ensure_tab_once(TAB_PAIR, P_COLS)
-    ensure_list_column_once("Driver")
     lists = get_lists()
     assets, wo, daily = load_all()
     pair = read_tab(TAB_PAIR).reindex(columns=P_COLS, fill_value="")
@@ -646,7 +643,8 @@ def page_pairing():
     heads = ready[ready["Tipe"] == "Head"].sort_values("Kode Unit")
     trailers = ready[ready["Tipe"] == "Trailer"].sort_values("Kode Unit")
     head_codes, trailer_codes = list(heads["Kode Unit"]), list(trailers["Kode Unit"])
-    driver_names = lists.get("Driver", [])
+    drv = load_drivers()
+    driver_names = sorted(drv[drv["Status Driver"] == "Aktif"]["Nama Driver"])
 
     tgl = st.date_input("Tanggal pairing", value=today(), min_value=today(),
                         max_value=today() + timedelta(days=1),
@@ -665,7 +663,7 @@ def page_pairing():
 
     st.subheader("Update pairing")
     if not driver_names:
-        st.warning("Daftar driver masih kosong. Isi nama driver di tab **Daftar Pilihan**, kolom **Driver** (satu nama per baris), lalu klik Refresh data.")
+        st.warning("Belum ada driver berstatus Aktif. Tambahkan driver di menu **Kelola Driver** (admin), lalu klik Refresh data.")
     if not head_codes:
         st.info("Belum ada Head berstatus Jalan/Standby. Isi atau perbarui Status Harian dulu.")
     elif not trailer_codes:
@@ -738,6 +736,20 @@ def page_pairing():
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         if bad:
             st.warning("Pasangan ini memuat unit yang sudah tidak Ready: " + ", ".join(bad) + ". Perbarui pairing.")
+        dinfo = drv.set_index("Nama Driver")
+        tt = pd.Timestamp(today())
+        dwarn = []
+        for nm in shown["Driver"]:
+            if not nm:
+                continue
+            stt = dinfo["Status Driver"].get(nm, "tidak ada di Master Driver")
+            exp = dinfo["Masa Berlaku SIM"].get(nm, pd.NaT)
+            if stt != "Aktif":
+                dwarn.append(f"{nm} ({stt})")
+            elif pd.notna(exp) and exp < tt:
+                dwarn.append(f"{nm} (SIM habis {exp:%d %b %Y})")
+        if dwarn:
+            st.warning("Periksa driver: " + ", ".join(dwarn) + ".")
         no_trailer = [h for h in head_codes if h not in set(with_trailer["Kode Head"])]
         free_trailer = [t for t in trailer_codes if t not in set(with_trailer["Kode Trailer"])]
         no_driver = [h for h in head_codes if h not in set(with_driver["Kode Head"])]
@@ -764,6 +776,92 @@ def page_pairing():
 
 
 # ----------------------------------------------------------------------------
+# Master Driver
+# ----------------------------------------------------------------------------
+def load_drivers():
+    ensure_tab_once(TAB_DRIVER, DR_COLS)
+    d = read_tab(TAB_DRIVER).reindex(columns=DR_COLS, fill_value="")
+    d["Masa Berlaku SIM"] = pd.to_datetime(d["Masa Berlaku SIM"], errors="coerce")
+    return d
+
+
+def next_driver_code(drv):
+    nums = pd.to_numeric(drv["Kode Driver"].str.replace("D-", "", regex=False), errors="coerce").dropna()
+    return f"D-{(int(nums.max()) if len(nums) else 0) + 1:03d}"
+
+
+def sim_alerts(drv, days=60):
+    """Driver (selain Nonaktif) yang SIM-nya sudah habis atau habis dalam `days` hari."""
+    x = drv[drv["Status Driver"] != "Nonaktif"].copy()
+    x["Sisa Hari"] = (x["Masa Berlaku SIM"] - pd.Timestamp(today())).dt.days
+    return x[x["Sisa Hari"] <= days].sort_values("Sisa Hari")
+
+
+NAMA_RE = re.compile(r"^[A-Z .'-]{3,40}$")
+
+
+def page_kelola_driver():
+    st.header("Kelola Driver")
+    lists = get_lists()
+    drv = load_drivers()
+    al = sim_alerts(drv)
+    if len(al):
+        st.warning(f"{len(al)} driver: SIM sudah habis atau habis dalam 60 hari.")
+        st.dataframe(al[["Kode Driver", "Nama Driver", "Jenis SIM", "Masa Berlaku SIM", "Sisa Hari", "Status Driver"]],
+                     hide_index=True, width="stretch",
+                     column_config={"Masa Berlaku SIM": st.column_config.DateColumn(format="DD MMM YYYY")})
+    tab1, tab2 = st.tabs(["Tambah driver", "Ubah data driver"])
+    with tab1:
+        with st.form("driver_baru", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            nama = c1.text_input("Nama driver (huruf saja)", max_chars=40)
+            sim = c2.selectbox("Jenis SIM", JENIS_SIM, index=None, placeholder="Pilih")
+            exp = c1.date_input("Masa berlaku SIM", value=today() + timedelta(days=365),
+                                min_value=today() - timedelta(days=3650), max_value=today() + timedelta(days=3650))
+            oleh = c2.selectbox("Dibuat oleh", lists.get("Tim", []), index=None, placeholder="Pilih nama")
+            ok = st.form_submit_button("Tambah driver", type="primary")
+        if ok:
+            nama = " ".join(nama.upper().split())
+            errs = []
+            if not NAMA_RE.match(nama):
+                errs.append("Nama: 3-40 karakter, hanya huruf, spasi, titik, apostrof, dan tanda -.")
+            if nama in set(drv["Nama Driver"].str.upper()):
+                errs.append("Nama driver sudah ada.")
+            if sim is None or oleh is None:
+                errs.append("Jenis SIM dan 'Dibuat oleh' harus dipilih.")
+            if errs:
+                for e in errs:
+                    st.error(e)
+            else:
+                code = next_driver_code(drv)
+                append_dicts(TAB_DRIVER, [{
+                    "Kode Driver": code, "Nama Driver": nama, "Jenis SIM": sim,
+                    "Masa Berlaku SIM": exp.isoformat(), "Status Driver": "Aktif",
+                    "Dibuat Oleh": oleh, "Waktu Input": stamp(),
+                }])
+                st.success(f"Driver {code} — {nama} ditambahkan.")
+    with tab2:
+        if drv.empty:
+            st.caption("Belum ada driver.")
+            return
+        st.caption("Kode dan nama dikunci. Driver yang berhenti: ubah Status menjadi Nonaktif (jangan dihapus agar riwayat pairing tetap terbaca). Driver berstatus Cuti/Sakit tidak muncul di pilihan pairing.")
+        edited = st.data_editor(
+            drv, hide_index=True, width="stretch", num_rows="fixed", key="edit_drivers",
+            disabled=["Kode Driver", "Nama Driver", "Dibuat Oleh", "Waktu Input"],
+            column_config={
+                "Jenis SIM": st.column_config.SelectboxColumn(options=with_current(JENIS_SIM, drv["Jenis SIM"])),
+                "Masa Berlaku SIM": st.column_config.DateColumn("Masa Berlaku SIM", format="DD MMM YYYY"),
+                "Status Driver": st.column_config.SelectboxColumn(options=STATUS_DRIVER, required=True),
+            },
+        )
+        if st.button("Simpan perubahan driver", type="primary"):
+            out = edited.copy()
+            out["Masa Berlaku SIM"] = pd.to_datetime(out["Masa Berlaku SIM"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+            rewrite_tab(TAB_DRIVER, DR_COLS, out[DR_COLS].astype(str).values.tolist())
+            st.success("Perubahan disimpan.")
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 PAGES = {
@@ -773,6 +871,7 @@ PAGES = {
     "Update Work Order": page_wo_update,
     "Status Harian": page_status_harian,
     "Kelola Asset": page_kelola_asset,
+    "Kelola Driver": page_kelola_driver,
 }
 
 
