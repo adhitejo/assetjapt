@@ -36,11 +36,15 @@ W_COLS = ["WO ID", "Tanggal Masuk", "Kode Unit", "Tipe", "Jenis Pekerjaan", "Kat
           "Estimasi Selesai", "Status WO", "Tanggal Selesai", "Biaya (Rp)", "Dibuat Oleh",
           "Waktu Input", "Diupdate Oleh", "Waktu Update"]
 D_COLS = ["Tanggal", "Kode Unit", "Tipe", "Status", "Lokasi", "Diisi Oleh", "Waktu Input"]
+TAB_PAIR = "Pairing Harian"
+P_COLS = ["Tanggal", "Kode Head", "Kode Trailer", "Diisi Oleh", "Waktu Input", "Driver"]
+NO_TRAILER = "(tanpa trailer)"
+NO_DRIVER = "(tanpa driver)"
 
 ROLES = {
     "owner": ["Dashboard"],
-    "input": ["Dashboard", "Work Order Baru", "Update Work Order", "Status Harian"],
-    "admin": ["Dashboard", "Work Order Baru", "Update Work Order", "Status Harian", "Kelola Asset"],
+    "input": ["Dashboard", "Ready & Pairing", "Work Order Baru", "Update Work Order", "Status Harian"],
+    "admin": ["Dashboard", "Ready & Pairing", "Work Order Baru", "Update Work Order", "Status Harian", "Kelola Asset"],
 }
 
 WIB = timezone(timedelta(hours=7))
@@ -90,6 +94,44 @@ def get_sheet():
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     return gspread.authorize(creds).open_by_key(st.secrets["SPREADSHEET_ID"])
+
+
+def ensure_tab_once(name, header):
+    """Buat tab bila belum ada, dan tambahkan kolom yang belum ada (sekali per sesi)."""
+    key = f"tab_ok_{name}"
+    if st.session_state.get(key):
+        return
+    sh = get_sheet()
+    try:
+        ws = sh.worksheet(name)
+        have = ws.row_values(1)
+        missing = [h for h in header if h not in have]
+        if missing:
+            new_header = have + missing
+            if ws.col_count < len(new_header):
+                ws.resize(cols=len(new_header) + 2)
+            ws.update(values=[new_header], range_name="A1")
+            st.cache_data.clear()
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=name, rows=2000, cols=len(header) + 2)
+        ws.update(values=[header], range_name="A1")
+        st.cache_data.clear()
+    st.session_state[key] = True
+
+
+def ensure_list_column_once(name):
+    """Tambahkan kolom daftar pilihan (mis. Driver) di tab Daftar Pilihan bila belum ada."""
+    key = f"listcol_{name}"
+    if st.session_state.get(key):
+        return
+    ws = get_sheet().worksheet(TAB_LIST)
+    have = ws.row_values(1)
+    if name not in have:
+        if ws.col_count < len(have) + 1:
+            ws.resize(cols=len(have) + 3)
+        ws.update(values=[[name]], range_name=rowcol_to_a1(1, len(have) + 1))
+        st.cache_data.clear()
+    st.session_state[key] = True
 
 
 @st.cache_data(ttl=30)
@@ -567,11 +609,166 @@ def page_kelola_asset():
             st.success("Perubahan disimpan.")
 
 
+
+# ----------------------------------------------------------------------------
+# Halaman: Ready & Pairing Head-Trailer-Driver
+# ----------------------------------------------------------------------------
+def pairing_defaults(pair, day, head_codes, trailer_codes, driver_names):
+    """Isian awal: pairing tanggal itu bila ada, kalau tidak pairing hari terakhir.
+    Hasil: {kode head: (trailer, driver)}"""
+    cur = pair[pair["Tanggal"] == day]
+    if cur.empty:
+        prev = pair[pair["Tanggal"] < day]
+        cur = prev[prev["Tanggal"] == prev["Tanggal"].max()] if len(prev) else prev
+    tm = dict(zip(cur["Kode Head"], cur["Kode Trailer"]))
+    dm = dict(zip(cur["Kode Head"], cur["Driver"]))
+    return {h: (tm.get(h) if tm.get(h) in trailer_codes else NO_TRAILER,
+                dm.get(h) if dm.get(h) in driver_names else NO_DRIVER) for h in head_codes}
+
+
+def page_pairing():
+    st.header("Unit Ready & Pairing Head–Trailer–Driver")
+    if "flash" in st.session_state:
+        st.success(st.session_state.pop("flash"))
+    ensure_tab_once(TAB_PAIR, P_COLS)
+    ensure_list_column_once("Driver")
+    lists = get_lists()
+    assets, wo, daily = load_all()
+    pair = read_tab(TAB_PAIR).reindex(columns=P_COLS, fill_value="")
+    pair["Tanggal"] = pd.to_datetime(pair["Tanggal"], errors="coerce")
+    assets = assets[assets["Status Aset"] == "Aktif"]
+    units = compute_units(assets, wo, daily)
+    if units.empty:
+        st.info("Belum ada asset aktif.")
+        return
+    info = units.set_index("Kode Unit")
+    ready = units[units["Status"].isin(["Jalan", "Standby"])]
+    heads = ready[ready["Tipe"] == "Head"].sort_values("Kode Unit")
+    trailers = ready[ready["Tipe"] == "Trailer"].sort_values("Kode Unit")
+    head_codes, trailer_codes = list(heads["Kode Unit"]), list(trailers["Kode Unit"])
+    driver_names = lists.get("Driver", [])
+
+    tgl = st.date_input("Tanggal pairing", value=today(), min_value=today(),
+                        max_value=today() + timedelta(days=1),
+                        help="Hari ini atau besok (untuk rencana). Kesiapan unit selalu berdasarkan status terbaru.")
+    ts = pd.Timestamp(tgl)
+    cur = pair[pair["Tanggal"] == ts]
+    with_trailer = cur[cur["Kode Trailer"] != ""]
+    with_driver = cur[cur["Driver"] != ""]
+
+    c = st.columns(5)
+    c[0].metric("Head Ready", len(head_codes))
+    c[1].metric("Trailer Ready", len(trailer_codes))
+    c[2].metric("Head + trailer", len(with_trailer))
+    c[3].metric("Head + driver", len(with_driver))
+    c[4].metric("Trailer Ready belum terpasang", len(set(trailer_codes) - set(with_trailer["Kode Trailer"])))
+
+    st.subheader("Update pairing")
+    if not driver_names:
+        st.warning("Daftar driver masih kosong. Isi nama driver di tab **Daftar Pilihan**, kolom **Driver** (satu nama per baris), lalu klik Refresh data.")
+    if not head_codes:
+        st.info("Belum ada Head berstatus Jalan/Standby. Isi atau perbarui Status Harian dulu.")
+    elif not trailer_codes:
+        st.info("Belum ada Trailer berstatus Jalan/Standby. Isi atau perbarui Status Harian dulu.")
+    else:
+        if cur.empty:
+            st.caption("Belum disimpan untuk tanggal ini. Isian awal mengikuti pairing terakhir; periksa lalu simpan.")
+        defaults = pairing_defaults(pair, ts, head_codes, trailer_codes, driver_names)
+        df = pd.DataFrame([{"Kode Head": h, "No Polisi Head": info.loc[h, "No Polisi / Serial"],
+                            "Status Head": info.loc[h, "Status"], "Trailer": defaults[h][0],
+                            "Driver": defaults[h][1]} for h in head_codes])
+        t_opts = [NO_TRAILER] + trailer_codes
+        d_opts = [NO_DRIVER] + driver_names
+        with st.form("pairing"):
+            edited = st.data_editor(
+                df, hide_index=True, width="stretch", num_rows="fixed",
+                disabled=["Kode Head", "No Polisi Head", "Status Head"],
+                column_config={
+                    "Trailer": st.column_config.SelectboxColumn("Trailer", options=t_opts, required=True),
+                    "Driver": st.column_config.SelectboxColumn("Driver", options=d_opts, required=True),
+                },
+                key=f"pair_{tgl}_{len(head_codes)}_{len(trailer_codes)}_{len(driver_names)}",
+            )
+            oleh = st.selectbox("Diisi oleh", lists.get("Tim", []), index=None, placeholder="Pilih nama")
+            ok = st.form_submit_button("Simpan Pairing", type="primary")
+        if ok:
+            tr = edited[edited["Trailer"] != NO_TRAILER]["Trailer"]
+            dr = edited[edited["Driver"] != NO_DRIVER]["Driver"]
+            dup_t, dup_d = sorted(set(tr[tr.duplicated()])), sorted(set(dr[dr.duplicated()]))
+            if oleh is None:
+                st.error("Pilih nama pengisi.")
+            elif dup_t or dup_d:
+                if dup_t:
+                    st.error("Trailer dipakai lebih dari satu Head: " + ", ".join(dup_t))
+                if dup_d:
+                    st.error("Driver dipasang di lebih dari satu Head: " + ", ".join(dup_d))
+            else:
+                ws = get_sheet().worksheet(TAB_PAIR)
+                values = ws.get_all_values()
+                header = values[0] if values else P_COLS
+                ix = header.index("Tanggal")
+                keep = [r + [""] * (len(header) - len(r)) for r in values[1:] if r[ix] != tgl.isoformat()]
+                new = []
+                for _, r in edited.iterrows():
+                    rec = {"Tanggal": tgl.isoformat(), "Kode Head": r["Kode Head"],
+                           "Kode Trailer": "" if r["Trailer"] == NO_TRAILER else r["Trailer"],
+                           "Driver": "" if r["Driver"] == NO_DRIVER else r["Driver"],
+                           "Diisi Oleh": oleh, "Waktu Input": stamp()}
+                    new.append([rec.get(h, "") for h in header])
+                rewrite_tab(TAB_PAIR, header, keep + new)
+                st.session_state["flash"] = (f"Pairing {tgl:%d %b %Y} tersimpan "
+                                             f"({len(tr)} trailer, {len(dr)} driver).")
+                st.rerun()
+
+    st.subheader("Pasangan tersimpan")
+    shown = cur[(cur["Kode Trailer"] != "") | (cur["Driver"] != "")]
+    if cur.empty:
+        st.caption("Belum ada pairing tersimpan untuk tanggal ini.")
+    else:
+        rows, bad = [], []
+        for _, r in shown.iterrows():
+            h, t = r["Kode Head"], r["Kode Trailer"]
+            hs = info["Status"].get(h, "-")
+            ts_ = info["Status"].get(t, "-") if t else "-"
+            rows.append({"Head": h, "Plat Head": info["No Polisi / Serial"].get(h, ""), "Status Head": hs,
+                         "Trailer": t or "-", "Plat Trailer": info["No Polisi / Serial"].get(t, "") if t else "",
+                         "Status Trailer": ts_, "Driver": r["Driver"] or "-"})
+            bad += [f"{k} ({v})" for k, v in ((h, hs), (t, ts_)) if k and v not in ("Jalan", "Standby", "-")]
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        if bad:
+            st.warning("Pasangan ini memuat unit yang sudah tidak Ready: " + ", ".join(bad) + ". Perbarui pairing.")
+        no_trailer = [h for h in head_codes if h not in set(with_trailer["Kode Head"])]
+        free_trailer = [t for t in trailer_codes if t not in set(with_trailer["Kode Trailer"])]
+        no_driver = [h for h in head_codes if h not in set(with_driver["Kode Head"])]
+        free_driver = [d for d in driver_names if d not in set(with_driver["Driver"])]
+        a1, a2 = st.columns(2)
+        a1.markdown("**Head Ready tanpa trailer**")
+        a1.write(", ".join(no_trailer) if no_trailer else "—")
+        a2.markdown("**Trailer Ready belum terpasang**")
+        a2.write(", ".join(free_trailer) if free_trailer else "—")
+        b1, b2 = st.columns(2)
+        b1.markdown("**Head Ready tanpa driver**")
+        b1.write(", ".join(no_driver) if no_driver else "—")
+        b2.markdown("**Driver belum ditugaskan**")
+        b2.write(", ".join(free_driver) if free_driver else "—")
+
+    with st.expander("Riwayat pairing 7 hari terakhir"):
+        h = pair[(pair["Tanggal"] >= ts - pd.Timedelta(days=7)) & ((pair["Kode Trailer"] != "") | (pair["Driver"] != ""))]
+        if h.empty:
+            st.caption("Belum ada riwayat.")
+        else:
+            st.dataframe(h.sort_values(["Tanggal", "Kode Head"], ascending=[False, True])[["Tanggal", "Kode Head", "Kode Trailer", "Driver", "Diisi Oleh"]],
+                         hide_index=True, width="stretch",
+                         column_config={"Tanggal": st.column_config.DateColumn(format="DD MMM YYYY")})
+
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 PAGES = {
     "Dashboard": page_dashboard,
+    "Ready & Pairing": page_pairing,
     "Work Order Baru": page_wo_baru,
     "Update Work Order": page_wo_update,
     "Status Harian": page_status_harian,
