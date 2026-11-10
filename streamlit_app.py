@@ -113,11 +113,11 @@ def ensure_tab_once(name, header):
         if missing:
             new_header = have + missing
             if ws.col_count < len(new_header):
-                ws.resize(cols=len(new_header) + 2)
+                ws.resize(cols=len(new_header))
             ws.update(values=[new_header], range_name="A1")
             st.cache_data.clear()
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=name, rows=2000, cols=len(header) + 2)
+        ws = sh.add_worksheet(title=name, rows=2000, cols=len(header))
         ws.update(values=[header], range_name="A1")
         st.cache_data.clear()
     st.session_state[key] = True
@@ -128,9 +128,17 @@ def read_tab(name: str) -> pd.DataFrame:
     values = get_sheet().worksheet(name).get_all_values()
     if not values:
         return pd.DataFrame()
-    header = values[0]
-    rows = [r + [""] * (len(header) - len(r)) for r in values[1:] if any(str(x).strip() for x in r)]
-    return pd.DataFrame(rows, columns=header)
+    raw_header = values[0]
+    keep = [i for i, h in enumerate(raw_header) if str(h).strip()]  # abaikan kolom tanpa judul
+    header = [raw_header[i].strip() for i in keep]
+    rows = []
+    for r in values[1:]:
+        r = list(r) + [""] * (len(raw_header) - len(r))
+        row = [r[i] for i in keep]
+        if any(str(x).strip() for x in row):
+            rows.append(row)
+    df = pd.DataFrame(rows, columns=header)
+    return df.loc[:, ~df.columns.duplicated()]
 
 
 def append_dicts(tab, dicts):
